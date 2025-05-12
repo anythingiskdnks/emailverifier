@@ -44,7 +44,6 @@ async function customSmtpCheck(email, mxRecords) {
         if (result.valid === false) {
           return result; // Definitive failure (e.g., user unknown)
         }
-        // If inconclusive (timeout/error), continue to next attempt/port/MX
         console.log(`SMTP check inconclusive on ${mx.exchange}:${port}: ${result.reason}`);
       }
     }
@@ -58,8 +57,9 @@ async function trySmtpConnection(email, mxHost, port) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let timeout;
+    let maxConnectionTime;
 
-    socket.setTimeout(10000); // 10-second timeout
+    socket.setTimeout(10000); // 10-second timeout for socket operations
 
     socket.on('connect', () => {
       console.log(`Connected to SMTP server ${mxHost}:${port}`);
@@ -92,15 +92,26 @@ async function trySmtpConnection(email, mxHost, port) {
       resolve({ valid: null, reason: `SMTP connection failed: ${error.message}` });
     });
 
+    socket.on('close', () => {
+      clearTimeout(timeout);
+      clearTimeout(maxConnectionTime);
+    });
+
     socket.connect(port, mxHost);
+
+    // Set a maximum connection time to prevent hanging
+    maxConnectionTime = setTimeout(() => {
+      console.log(`Maximum connection time exceeded on ${mxHost}:${port}`);
+      socket.destroy();
+      resolve({ valid: null, reason: 'Maximum connection time exceeded' });
+    }, 10000);
+
+    // Ensure timeout is cleared if connection closes early
     timeout = setTimeout(() => {
+      console.log(`SMTP timeout on ${mxHost}:${port}`);
       socket.destroy();
       resolve({ valid: null, reason: 'SMTP timeout' });
     }, 10000);
-
-    socket.on('close', () => {
-      clearTimeout(timeout);
-    });
   });
 }
 
