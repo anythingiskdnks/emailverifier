@@ -17,20 +17,27 @@ app.post('/verify-email', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email format' });
     }
 
-    // Perform deep email validation
+    // Perform deep email validation with SMTP
     const result = await deepEmailValidator.validate({
       email,
       validateRegex: true,
       validateMx: true,
       validateTypo: true,
       validateDisposable: true,
-      validateSMTP: false // SMTP checks can be slow and less reliable
+      validateSMTP: true, // Enable SMTP for accurate bounce detection
+      timeout: 10000 // 10-second timeout for SMTP checks
     });
 
     // Determine deliverability status
     const status = result.valid ? 'deliverable' : 'undeliverable';
-    const reason = !result.valid ? result.reason : null;
     const willBounce = !result.valid;
+    const reason = !result.valid ? result.reason : 'Email is valid';
+    const smtpFailed = result.validators.smtp && !result.validators.smtp.valid && result.validators.smtp.reason.includes('timeout');
+
+    // Add note if SMTP check failed but other checks passed
+    const additionalInfo = smtpFailed && result.validators.mx.valid && result.validators.disposable.valid
+      ? 'SMTP check failed (possible server restriction), but MX and disposable checks passed.'
+      : '';
 
     res.json({
       email,
@@ -41,7 +48,9 @@ app.post('/verify-email', async (req, res) => {
         validMx: result.validators.mx.valid,
         validTypo: result.validators.typo.valid,
         isDisposable: !result.validators.disposable.valid,
-        reason: reason || 'Email is valid'
+        validSmtp: result.validators.smtp ? result.validators.smtp.valid : null,
+        reason: reason || 'Email is valid',
+        additionalInfo
       }
     });
   } catch (error) {
