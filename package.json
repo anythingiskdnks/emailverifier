@@ -1,0 +1,17 @@
+{
+  "name": "email-verifier",
+  "version": "1.0.0",
+  "description": "Email verification API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "validator": "^13.9.0",
+    "deep-email-validator": "^0.1.21"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
