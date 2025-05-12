@@ -20,20 +20,38 @@ async function getMxRecords(domain) {
   }
 }
 
-// Custom SMTP check function
+// Custom SMTP check function with retry on multiple MX records
 async function customSmtpCheck(email, mxRecords) {
   if (!mxRecords || !Array.isArray(mxRecords) || mxRecords.length === 0) {
     return { valid: null, reason: 'No valid MX records provided for SMTP check' };
   }
 
   const [user, domain] = email.split('@');
-  const socket = new net.Socket();
-  let timeout;
+  let lastError = null;
 
+  // Try each MX record in order of priority
+  for (const mx of mxRecords.sort((a, b) => a.priority - b.priority)) {
+    console.log(`Attempting SMTP check for ${email} on ${mx.exchange}`);
+    const result = await trySmtpConnection(email, mx.exchange);
+    if (result.valid !== null) {
+      return result; // Return on success or definitive failure
+    }
+    lastError = result.reason;
+  }
+
+  return { valid: null, reason: lastError || 'All SMTP checks failed' };
+}
+
+// Helper function for a single SMTP connection attempt
+async function trySmtpConnection(email, mxHost) {
   return new Promise((resolve) => {
-    socket.setTimeout(5000); // 5-second timeout
+    const socket = new net.Socket();
+    let timeout;
+
+    socket.setTimeout(8000); // 8-second timeout
 
     socket.on('connect', () => {
+      console.log(`Connected to SMTP server ${mxHost}`);
       socket.write('HELO localhost\r\n');
       socket.write(`MAIL FROM:<test@example.com>\r\n`);
       socket.write(`RCPT TO:<${email}>\r\n`);
@@ -41,6 +59,7 @@ async function customSmtpCheck(email, mxRecords) {
 
     socket.on('data', (data) => {
       const response = data.toString();
+      console.log(`SMTP response from ${mxHost}: ${response.trim()}`);
       if (response.includes('250') || response.includes('220')) {
         socket.destroy();
         resolve({ valid: true, reason: 'SMTP connection successful' });
@@ -51,20 +70,22 @@ async function customSmtpCheck(email, mxRecords) {
     });
 
     socket.on('timeout', () => {
+      console.log(`SMTP timeout on ${mxHost}`);
       socket.destroy();
-      resolve({ valid: false, reason: 'SMTP timeout' });
+      resolve({ valid: null, reason: 'SMTP timeout' });
     });
 
-    socket.on('error', () => {
+    socket.on('error', (error) => {
+      console.log(`SMTP error on ${mxHost}: ${error.message}`);
       socket.destroy();
-      resolve({ valid: false, reason: 'SMTP connection failed' });
+      resolve({ valid: null, reason: `SMTP connection failed: ${error.message}` });
     });
 
-    socket.connect(25, mxRecords[0].exchange);
+    socket.connect(25, mxHost);
     timeout = setTimeout(() => {
       socket.destroy();
-      resolve({ valid: false, reason: 'SMTP timeout' });
-    }, 5000);
+      resolve({ valid: null, reason: 'SMTP timeout' });
+    }, 8000);
 
     socket.on('close', () => {
       clearTimeout(timeout);
@@ -109,7 +130,7 @@ app.post('/verify-email', async (req, res) => {
     }
 
     // Determine deliverability status
-    const isValid = result.valid && (customSmtpResult.valid !== false || (result.validators.mx.valid && mxRecords.length === 0));
+    const isValid = result.valid && (customSmtpResult.valid === true || customSmtpResult.valid === null || (result.validators.mx.valid && mxRecords.length === 0));
     const status = isValid ? 'deliverable' : 'undeliverable';
     const willBounce = !isValid;
     const reason = !isValid
@@ -129,8 +150,8 @@ app.post('/verify-email', async (req, res) => {
         reason: reason || 'Email is valid',
         additionalInfo: customSmtpResult.valid === false
           ? `Custom SMTP check failed: ${customSmtpResult.reason}`
-          : mxRecords.length === 0 && result.validators.mx.valid
-          ? 'Manual MX lookup failed, but validator confirms MX records exist'
+          : customSmtpResult.valid === null && result.validators.mx.valid
+          ? 'SMTP check inconclusive, but validator confirms MX records exist'
           : ''
       }
     });
