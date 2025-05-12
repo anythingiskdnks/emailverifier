@@ -10,15 +10,17 @@ app.use(express.json());
 
 // Custom SMTP check function
 async function customSmtpCheck(email, mxRecords) {
+  // Check if mxRecords is valid
+  if (!mxRecords || !Array.isArray(mxRecords) || mxRecords.length === 0) {
+    return { valid: null, reason: 'No valid MX records provided for SMTP check' };
+  }
+
+  // Use the first MX record for the SMTP connection
+  const [user, domain] = email.split('@');
+  const socket = new net.Socket();
+  let timeout;
+
   return new Promise((resolve) => {
-    if (!mxRecords || mxRecords.length === 0) {
-      return resolve({ valid: false, reason: 'No MX records found' });
-    }
-
-    const [user, domain] = email.split('@');
-    const socket = new net.Socket();
-    let timeout;
-
     socket.setTimeout(5000); // 5-second timeout
 
     socket.on('connect', () => {
@@ -80,10 +82,15 @@ app.post('/verify-email', async (req, res) => {
       validateSMTP: false // Disable built-in SMTP due to unreliability
     });
 
-    // Custom SMTP check if MX records are valid
+    // Log MX records for debugging
+    console.log('MX Records for', email, ':', JSON.stringify(result.validators.mx.data, null, 2));
+
+    // Custom SMTP check
     let customSmtpResult = { valid: null, reason: 'SMTP check skipped' };
-    if (result.validators.mx.valid) {
+    if (result.validators.mx.valid && Array.isArray(result.validators.mx.data) && result.validators.mx.data.length > 0) {
       customSmtpResult = await customSmtpCheck(email, result.validators.mx.data);
+    } else if (!result.validators.mx.valid) {
+      customSmtpResult = { valid: false, reason: 'No MX records found by validator' };
     }
 
     // Determine deliverability status
