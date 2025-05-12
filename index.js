@@ -2,20 +2,30 @@ const express = require('express');
 const { isEmail } = require('validator');
 const deepEmailValidator = require('deep-email-validator');
 const net = require('net');
+const dns = require('dns').promises;
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Middleware to parse JSON bodies
 app.use(express.json());
 
+// Custom MX record lookup
+async function getMxRecords(domain) {
+  try {
+    const records = await dns.resolveMx(domain);
+    return records.map(record => ({ exchange: record.exchange, priority: record.priority }));
+  } catch (error) {
+    console.error(`MX lookup failed for ${domain}:`, error);
+    return [];
+  }
+}
+
 // Custom SMTP check function
 async function customSmtpCheck(email, mxRecords) {
-  // Check if mxRecords is valid
   if (!mxRecords || !Array.isArray(mxRecords) || mxRecords.length === 0) {
     return { valid: null, reason: 'No valid MX records provided for SMTP check' };
   }
 
-  // Use the first MX record for the SMTP connection
   const [user, domain] = email.split('@');
   const socket = new net.Socket();
   let timeout;
@@ -82,19 +92,24 @@ app.post('/verify-email', async (req, res) => {
       validateSMTP: false // Disable built-in SMTP due to unreliability
     });
 
-    // Log MX records for debugging
-    console.log('MX Records for', email, ':', JSON.stringify(result.validators.mx.data, null, 2));
+    // Log deep-email-validator MX data for debugging
+    console.log('Deep Validator MX for', email, ':', JSON.stringify(result.validators.mx.data, null, 2));
+
+    // Perform manual MX lookup
+    const [, domain] = email.split('@');
+    const mxRecords = await getMxRecords(domain);
+    console.log('Manual MX Records for', email, ':', JSON.stringify(mxRecords, null, 2));
 
     // Custom SMTP check
     let customSmtpResult = { valid: null, reason: 'SMTP check skipped' };
-    if (result.validators.mx.valid && Array.isArray(result.validators.mx.data) && result.validators.mx.data.length > 0) {
-      customSmtpResult = await customSmtpCheck(email, result.validators.mx.data);
+    if (mxRecords.length > 0) {
+      customSmtpResult = await customSmtpCheck(email, mxRecords);
     } else if (!result.validators.mx.valid) {
       customSmtpResult = { valid: false, reason: 'No MX records found by validator' };
     }
 
     // Determine deliverability status
-    const isValid = result.valid && (customSmtpResult.valid !== false);
+    const isValid = result.valid && (customSmtpResult.valid !== false || (result.validators.mx.valid && mxRecords.length === 0));
     const status = isValid ? 'deliverable' : 'undeliverable';
     const willBounce = !isValid;
     const reason = !isValid
@@ -114,6 +129,8 @@ app.post('/verify-email', async (req, res) => {
         reason: reason || 'Email is valid',
         additionalInfo: customSmtpResult.valid === false
           ? `Custom SMTP check failed: ${customSmtpResult.reason}`
+          : mxRecords.length === 0 && result.validators.mx.valid
+          ? 'Manual MX lookup failed, but validator confirms MX records exist'
           : ''
       }
     });
