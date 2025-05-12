@@ -1,11 +1,64 @@
 const express = require('express');
 const { isEmail } = require('validator');
 const deepEmailValidator = require('deep-email-validator');
+const net = require('net');
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Middleware to parse JSON bodies
 app.use(express.json());
+
+// Custom SMTP check function
+async function customSmtpCheck(email, mxRecords) {
+  return new Promise((resolve) => {
+    if (!mxRecords || mxRecords.length === 0) {
+      return resolve({ valid: false, reason: 'No MX records found' });
+    }
+
+    const [user, domain] = email.split('@');
+    const socket = new net.Socket();
+    let timeout;
+
+    socket.setTimeout(5000); // 5-second timeout
+
+    socket.on('connect', () => {
+      socket.write('HELO localhost\r\n');
+      socket.write(`MAIL FROM:<test@example.com>\r\n`);
+      socket.write(`RCPT TO:<${email}>\r\n`);
+    });
+
+    socket.on('data', (data) => {
+      const response = data.toString();
+      if (response.includes('250') || response.includes('220')) {
+        socket.destroy();
+        resolve({ valid: true, reason: 'SMTP connection successful' });
+      } else if (response.includes('550') || response.includes('554')) {
+        socket.destroy();
+        resolve({ valid: false, reason: 'SMTP rejected: user unknown or mailbox unavailable' });
+      }
+    });
+
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve({ valid: false, reason: 'SMTP timeout' });
+    });
+
+    socket.on('error', () => {
+      socket.destroy();
+      resolve({ valid: false, reason: 'SMTP connection failed' });
+    });
+
+    socket.connect(25, mxRecords[0].exchange);
+    timeout = setTimeout(() => {
+      socket.destroy();
+      resolve({ valid: false, reason: 'SMTP timeout' });
+    }, 5000);
+
+    socket.on('close', () => {
+      clearTimeout(timeout);
+    });
+  });
+}
 
 // Email verification endpoint
 app.post('/verify-email', async (req, res) => {
@@ -17,37 +70,29 @@ app.post('/verify-email', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email format' });
     }
 
-    // Perform deep email validation with SMTP
+    // Perform deep email validation without SMTP
     const result = await deepEmailValidator.validate({
       email,
       validateRegex: true,
       validateMx: true,
       validateTypo: true,
       validateDisposable: true,
-      validateSMTP: true, // Enable SMTP for accurate bounce detection
-      timeout: 10000 // 10-second timeout for SMTP checks
+      validateSMTP: false // Disable built-in SMTP due to unreliability
     });
 
-    // Determine deliverability status
-    const status = result.valid ? 'deliverable' : 'undeliverable';
-    const willBounce = !result.valid;
-    const reason = !result.valid ? result.reason : 'Email is valid';
-
-    // Safely check if SMTP check timed out
-    let smtpFailed = false;
-    if (
-      result.validators.smtp &&
-      !result.validators.smtp.valid &&
-      typeof result.validators.smtp.reason === 'string' &&
-      result.validators.smtp.reason.includes('timeout')
-    ) {
-      smtpFailed = true;
+    // Custom SMTP check if MX records are valid
+    let customSmtpResult = { valid: null, reason: 'SMTP check skipped' };
+    if (result.validators.mx.valid) {
+      customSmtpResult = await customSmtpCheck(email, result.validators.mx.data);
     }
 
-    // Add note if SMTP check failed but other checks passed
-    const additionalInfo = smtpFailed && result.validators.mx.valid && result.validators.disposable.valid
-      ? 'SMTP check failed (possible server restriction), but MX and disposable checks passed.'
-      : '';
+    // Determine deliverability status
+    const isValid = result.valid && (customSmtpResult.valid !== false);
+    const status = isValid ? 'deliverable' : 'undeliverable';
+    const willBounce = !isValid;
+    const reason = !isValid
+      ? (customSmtpResult.reason !== 'SMTP check skipped' ? customSmtpResult.reason : result.reason)
+      : 'Email is valid';
 
     res.json({
       email,
@@ -58,9 +103,11 @@ app.post('/verify-email', async (req, res) => {
         validMx: result.validators.mx.valid,
         validTypo: result.validators.typo.valid,
         isDisposable: !result.validators.disposable.valid,
-        validSmtp: result.validators.smtp ? result.validators.smtp.valid : null,
+        validSmtp: customSmtpResult.valid,
         reason: reason || 'Email is valid',
-        additionalInfo
+        additionalInfo: customSmtpResult.valid === false
+          ? `Custom SMTP check failed: ${customSmtpResult.reason}`
+          : ''
       }
     });
   } catch (error) {
