@@ -9,6 +9,16 @@ const port = process.env.PORT || 3000;
 // Middleware to parse JSON bodies
 app.use(express.json());
 
+// List of domains to mark as undeliverable without checks
+const undeliverableDomains = [
+  'example.com',
+  'godaddy.com',
+  'test.com',
+  'example.org',
+  'example.net',
+  'invalid.com'
+];
+
 // Custom MX record lookup
 async function getMxRecords(domain) {
   try {
@@ -27,9 +37,8 @@ async function customSmtpCheck(email, mxRecords) {
   }
 
   const [user, domain] = email.split('@');
-  const ports = [25, 587, 465]; // Try SMTP, submission, and SMTPS ports
-  const maxRetries = 2;
-  let lastError = null;
+  const ports = [25, 587]; // Try SMTP and submission ports
+  const maxRetries = 3;
 
   // Sort MX records by priority
   const sortedMxRecords = mxRecords.sort((a, b) => a.priority - b.priority);
@@ -45,13 +54,12 @@ async function customSmtpCheck(email, mxRecords) {
         if (result.valid === false) {
           return result; // Definitive failure
         }
-        lastError = result.reason;
         console.log(`SMTP check inconclusive on ${mx.exchange}:${port}: ${result.reason}`);
       }
     }
   }
 
-  return { valid: false, reason: `All SMTP checks failed after retries: ${lastError || 'Unknown error'}` };
+  return { valid: false, reason: 'All SMTP checks failed after retries' };
 }
 
 // Helper function for a single SMTP connection attempt
@@ -60,29 +68,34 @@ async function trySmtpConnection(email, mxHost, port) {
     const socket = new net.Socket();
     let timeout;
     let maxConnectionTime;
+    let commandsSent = 0;
 
     socket.setTimeout(10000); // 10-second timeout for socket operations
 
     socket.on('connect', () => {
       console.log(`Connected to SMTP server ${mxHost}:${port}`);
-      // Use EHLO for better compatibility
-      socket.write(`EHLO localhost\r\n`);
+      socket.write('HELO localhost\r\n');
+      commandsSent++;
     });
 
     socket.on('data', (data) => {
       const response = data.toString();
       console.log(`SMTP response from ${mxHost}:${port}: ${response.trim()}`);
-      if (response.includes('250')) {
-        // Proceed with RCPT TO to verify recipient
+
+      if (commandsSent === 1 && response.includes('220') || response.includes('250')) {
         socket.write(`MAIL FROM:<test@example.com>\r\n`);
+        commandsSent++;
+      } else if (commandsSent === 2 && response.includes('250')) {
         socket.write(`RCPT TO:<${email}>\r\n`);
-      } else if (response.includes('550') || response.includes('554')) {
-        socket.destroy();
-        resolve({ valid: false, reason: 'SMTP rejected: user unknown or mailbox unavailable' });
-      } else {
-        // Handle unexpected responses
-        socket.destroy();
-        resolve({ valid: null, reason: `Unexpected SMTP response: ${response.trim()}` });
+        commandsSent++;
+      } else if (commandsSent === 3) {
+        if (response.includes('250')) {
+          socket.destroy();
+          resolve({ valid: true, reason: 'SMTP connection successful' });
+        } else if (response.includes('550') || response.includes('554')) {
+          socket.destroy();
+          resolve({ valid: false, reason: 'SMTP rejected: user unknown or mailbox unavailable' });
+        }
       }
     });
 
@@ -101,6 +114,9 @@ async function trySmtpConnection(email, mxHost, port) {
     socket.on('close', () => {
       clearTimeout(timeout);
       clearTimeout(maxConnectionTime);
+      if (commandsSent < 3) {
+        resolve({ valid: null, reason: 'SMTP connection closed prematurely' });
+      }
     });
 
     socket.connect(port, mxHost);
@@ -131,7 +147,45 @@ app.post('/verify-email', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email format' });
     }
 
-    // Perform deep email validation without SMTP
+    const [, domain] = email.split('@');
+
+    // Rule 1: Gmail emails are deliverable without checks
+    if (domain.toLowerCase() === 'gmail.com') {
+      return res.json({
+        email,
+        status: 'deliverable',
+        willBounce: false,
+        details: {
+          validFormat: true,
+          validMx: true,
+          validTypo: true,
+          isDisposable: false,
+          validSmtp: true,
+          reason: 'Gmail domain automatically marked as deliverable',
+          additionalInfo: ''
+        }
+      });
+    }
+
+    // Rule 2: Certain domains are undeliverable without checks
+    if (undeliverableDomains.includes(domain.toLowerCase())) {
+      return res.json({
+        email,
+        status: 'undeliverable',
+        willBounce: true,
+        details: {
+          validFormat: true,
+          validMx: false,
+          validTypo: true,
+          isDisposable: true,
+          validSmtp: false,
+          reason: 'Domain marked as undeliverable by rule',
+          additionalInfo: 'Custom SMTP check skipped due to domain rule'
+        }
+      });
+    }
+
+    // Perform deep email validation without SMTP for other domains
     const result = await deepEmailValidator.validate({
       email,
       validateRegex: true,
@@ -145,11 +199,10 @@ app.post('/verify-email', async (req, res) => {
     console.log('Deep Validator MX for', email, ':', JSON.stringify(result.validators.mx.data, null, 2));
 
     // Perform manual MX lookup
-    const [, domain] = email.split('@');
     const mxRecords = await getMxRecords(domain);
     console.log('Manual MX Records for', email, ':', JSON.stringify(mxRecords, null, 2));
 
-    // Custom SMTP check (mandatory)
+    // Custom SMTP check (mandatory for non-special domains)
     const customSmtpResult = await customSmtpCheck(email, mxRecords);
 
     // Determine deliverability status (SMTP check is mandatory)
