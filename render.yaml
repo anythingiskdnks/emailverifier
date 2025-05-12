@@ -3,7 +3,7 @@ services:
     name: email-verifier
     env: python
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python app.py"
+    startCommand: "gunicorn -w 4 app:app"
     instances: 1
     region: oregon
     envVars:
