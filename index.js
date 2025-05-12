@@ -32,7 +32,17 @@ app.post('/verify-email', async (req, res) => {
     const status = result.valid ? 'deliverable' : 'undeliverable';
     const willBounce = !result.valid;
     const reason = !result.valid ? result.reason : 'Email is valid';
-    const smtpFailed = result.validators.smtp && !result.validators.smtp.valid && result.validators.smtp.reason.includes('timeout');
+
+    // Safely check if SMTP check timed out
+    let smtpFailed = false;
+    if (
+      result.validators.smtp &&
+      !result.validators.smtp.valid &&
+      typeof result.validators.smtp.reason === 'string' &&
+      result.validators.smtp.reason.includes('timeout')
+    ) {
+      smtpFailed = true;
+    }
 
     // Add note if SMTP check failed but other checks passed
     const additionalInfo = smtpFailed && result.validators.mx.valid && result.validators.disposable.valid
